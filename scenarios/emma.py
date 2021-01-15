@@ -90,21 +90,6 @@ class EmmaScenario(Scenario):
         self.log('[8] broker shuts down in us-east')
         yield us_east_broker.shutdown()
 
-    def create_initial_topology(self) -> Topology:
-        topology = Topology()
-        topology.load_inet_graph('cloudping')
-        # maps region names of cloudping dataset to custom region names
-        region_map = {
-            'internet_eu-west-1': 'eu-west',
-            'internet_eu-central-1': 'eu-central',
-            'internet_us-east-1': 'us-east',
-        }
-        # remove all or regions from the graph
-        topology.remove_nodes_from([n for n in topology.nodes if n not in region_map.keys()])
-        # relabel the region nodes according to the map above
-        nx.relabel_nodes(topology, region_map, copy=False)
-        return topology
-
 
 def main():
     parser = argparse.ArgumentParser()

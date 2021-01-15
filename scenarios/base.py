@@ -3,6 +3,7 @@ import logging
 import random
 from typing import TextIO, List
 
+import networkx as nx
 import numpy
 import simpy
 
@@ -81,9 +82,20 @@ class Scenario(metaclass=abc.ABCMeta):
     def sleep(self):
         return self.env.timeout(self.action_interval * 60_000)
 
-    @abc.abstractmethod
     def create_initial_topology(self) -> Topology:
-        ...
+        topology = Topology()
+        topology.load_inet_graph('cloudping')
+        # maps region names of cloudping dataset to custom region names
+        region_map = {
+            'internet_eu-west-1': 'eu-west',
+            'internet_eu-central-1': 'eu-central',
+            'internet_us-east-1': 'us-east',
+        }
+        # remove all or regions from the graph
+        topology.remove_nodes_from([n for n in topology.nodes if n not in region_map.keys()])
+        # relabel the region nodes according to the map above
+        nx.relabel_nodes(topology, region_map, copy=False)
+        return topology
 
     @abc.abstractmethod
     def scenario_process(self):
