@@ -35,7 +35,7 @@ class NodeProcess(ABC):
         accepted_types = self.handlers.keys()
         while self.running:
             message: Message = yield self.receive(*accepted_types)
-            if self.execute_vivaldi and isinstance(message.source.coordinate, VivaldiCoordinate):
+            if self.execute_vivaldi and message.latency > 0:
                 vivaldi.execute(self.node, message.source, message.latency * 2)
             result = self.handlers[type(message)](message)
             if isinstance(result, Generator):
