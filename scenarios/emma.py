@@ -107,7 +107,6 @@ class EmmaScenario(Scenario):
 
 
 def main():
-    logging.basicConfig(filename='emma.log', level=logging.DEBUG)
     parser = argparse.ArgumentParser()
     parser.add_argument('-v', '--verbose', action='store_true', default=False, help='print stats')
     parser.add_argument('-o', '--output', type=str, help='path to CSV output')
