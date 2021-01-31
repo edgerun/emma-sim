@@ -1,7 +1,9 @@
 import abc
 import logging
 import random
-from typing import TextIO, List
+from collections import defaultdict
+from itertools import count
+from typing import TextIO, List, Dict, Iterator
 
 import networkx as nx
 import numpy
@@ -21,6 +23,7 @@ class Scenario(metaclass=abc.ABCMeta):
     action_interval: int
     publish_interval: int
 
+    broker_counters: Dict[str, Iterator[int]]
     broker_procs: List[BrokerProcess]
     client_procs: List[ClientProcess]
     topology: Topology
@@ -36,6 +39,7 @@ class Scenario(metaclass=abc.ABCMeta):
         self.use_vivaldi = use_vivaldi
         self.action_interval = action_interval
         self.publish_interval = publish_interval
+        self.broker_counters = defaultdict(lambda: count(1))
         self.broker_procs = []
         self.client_procs = []
         self.env = simpy.Environment()
@@ -46,16 +50,23 @@ class Scenario(metaclass=abc.ABCMeta):
             console_handler = logging.StreamHandler()
             logging.getLogger().addHandler(console_handler)
 
+    def spawn_existing_broker(self, broker: Broker) -> BrokerProcess:
+        bp = BrokerProcess(self.env, self.protocol, broker, self.broker_procs, self.use_vivaldi)
+        self.env.process(bp.run())
+        self.broker_procs.append(bp)
+        return bp
+
+    def create_cloud_broker(self, region: str) -> BrokerProcess:
+        broker = Broker(f'{region}_broker_{next(self.broker_counters[region])}', backhaul=region)
+        broker.materialize(self.topology)
+        bp = BrokerProcess(self.env, self.protocol, broker, self.broker_procs, self.use_vivaldi)
+        self.broker_procs.append(bp)
+        return bp
+
     def spawn_broker(self, backhaul, name: str) -> BrokerProcess:
         broker = Broker(name, backhaul=backhaul)
         broker.materialize(self.topology)
-        bp = BrokerProcess(self.env, self.protocol, broker, self.broker_procs, self.use_vivaldi)
-        self.env.process(bp.run())
-        self.env.process(bp.run_pub_process())
-        if self.use_vivaldi:
-            self.env.process(bp.ping_all(lambda: map(lambda bp: bp.node, self.broker_procs)))
-        self.broker_procs.append(bp)
-        return bp
+        return self.spawn_existing_broker(broker)
 
     def spawn_client(self, backhaul, name: str, topic: str, publishers=0, subscribe=False) -> ClientProcess:
         client = Client(name, backhaul=backhaul)

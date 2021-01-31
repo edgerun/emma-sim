@@ -2,11 +2,12 @@ import random
 from abc import abstractmethod, ABC
 from copy import copy
 from itertools import product
-from typing import Union, Set, Iterable, Generator, Callable
+from typing import Union, Set, Iterable, Generator, Callable, Tuple
 
 from ether import vivaldi
 from ether.cell import Broker, Client
 from ether.vivaldi import VivaldiCoordinate
+from simulation.network_context import NetworkContext
 from simulation.protocol import *
 
 
@@ -189,6 +190,12 @@ class BrokerProcess(NodeProcess):
             Unsub: self.handle_unsubscribe,
         })
 
+    def run(self):
+        self.env.process(self.run_pub_process())
+        if self.execute_vivaldi:
+            self.env.process(self.ping_all(lambda: [bp.node for bp in self.broker_procs if bp.running]))
+        return super().run()
+
     def handle_random_brokers(self, message: FindRandomBrokersRequest):
         yield self.send(message.source, FindRandomBrokersResponse([b.node for b in random.choices(self.brokers, k=5)]))
 
@@ -324,3 +331,75 @@ class CoordinatorProcess:
             if len(group_brokers) > 0:
                 return group_brokers
         return []
+
+
+class StartAllBrokerOrchestrationProcess:
+    env: simpy.Environment
+    broker_procs: List[BrokerProcess]
+
+    def __init__(self, env: simpy.Environment, broker_procs: List[BrokerProcess]):
+        self.env = env
+        self.broker_procs = broker_procs
+
+    def run(self):
+        while True:
+            for bp in self.broker_procs:
+                if not bp.running:
+                    self.env.run(bp.run)
+            yield self.env.timeout(15_000)
+
+
+class DistanceBasedBrokerScalerProcess:
+    env: simpy.Environment
+    context: NetworkContext
+
+    def __init__(self, env: simpy.Environment, context: NetworkContext, th_up: float, th_down: float):
+        self.env = env
+        self.context = context
+        self.th_up = th_up
+        self.th_down = th_down
+
+    def run(self):
+        while True:
+            worker_pressures = self.get_worker_pressures(False)
+            p_min = self.calculate_min_pressure()
+            p_max = self.calculate_max_pressure()
+
+            # scale up
+            if len(worker_pressures) > 0:
+                candidate_worker, pressure = max(worker_pressures, lambda t: t[1])
+                pressure = (pressure - p_min) / (p_max - p_min)
+                if pressure > self.th_up:
+                    self.env.process(candidate_worker.run())
+
+            # scale down (only if more than one broker is left)
+            if len(self.context.get_brokers()) > 1:
+                candidate_worker, pressure = min(self.get_worker_pressures(True), lambda t: t[1])
+                pressure = (pressure - p_min) / (p_max - p_min)
+                if pressure < self.th_down:
+                    candidate_worker.shutdown()
+
+            yield self.env.timeout(60_000)
+
+    def get_worker_pressures(self, has_broker: bool) -> List[Tuple[BrokerProcess, float]]:
+        pressures = []
+        for worker in self.context.get_workers(has_broker):
+            pressure = 0
+            for _, distance in self.get_client_distances(worker):
+                pressure += 1 / distance
+            pressures.append((worker, pressure))
+        return pressures
+
+    def calculate_max_pressure(self):
+        return self.context.get_num_clients()
+
+    def calculate_min_pressure(self):
+        min_pressure = int('Inf')
+        for worker in self.context.get_all_workers():
+            pressure = 1 / max(self.get_client_distances(worker), lambda t: t[1])
+            if pressure < min_pressure:
+                min_pressure = pressure
+        return min_pressure
+
+    def get_client_distances(self, worker: BrokerProcess) -> List[Tuple[ClientProcess, float]]:
+        return [(client, worker.node.distance_to(client.node)) for client in self.context.client_procs]
