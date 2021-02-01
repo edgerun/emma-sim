@@ -1,8 +1,7 @@
-from typing import List
-
-import simpy
+from typing import List, Tuple
 
 from ether.topology import Topology
+
 from simulation.processes import BrokerProcess, ClientProcess
 
 
@@ -30,3 +29,9 @@ class NetworkContext:
 
     def get_num_clients(self) -> int:
         return len(self.client_procs)
+
+    def get_clients(self) -> List[ClientProcess]:
+        return self.client_procs
+
+    def get_client_distances(self, worker: BrokerProcess) -> List[Tuple[ClientProcess, float]]:
+        return [(client, worker.node.distance_to(client.node)) for client in self.get_clients()]
