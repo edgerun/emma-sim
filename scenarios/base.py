@@ -2,17 +2,18 @@ import abc
 import logging
 import random
 from collections import defaultdict
-from itertools import count
 from typing import TextIO, List, Dict, Iterator
 
 import networkx as nx
 import numpy
 import simpy
+from itertools import count
 
-from ether.cell import Broker, Client
-from ether.core import Connection
+from ether.cell import Broker, Client, Host
+from ether.core import Connection, Node
 from ether.topology import Topology
-from simulation.processes import BrokerProcess, ClientProcess, CoordinatorProcess
+from simulation.network_context import NetworkContext
+from simulation.processes import BrokerProcess, ClientProcess, CoordinatorProcess, WorkerProcess
 from simulation.protocol import Protocol
 
 
@@ -24,8 +25,8 @@ class Scenario(metaclass=abc.ABCMeta):
     publish_interval: int
 
     broker_counters: Dict[str, Iterator[int]]
-    broker_procs: List[BrokerProcess]
-    client_procs: List[ClientProcess]
+    worker_counters: Dict[str, Iterator[int]]
+    ctx: NetworkContext
     topology: Topology
     env: simpy.Environment
     csv_file: TextIO
@@ -40,8 +41,9 @@ class Scenario(metaclass=abc.ABCMeta):
         self.action_interval = action_interval
         self.publish_interval = publish_interval
         self.broker_counters = defaultdict(lambda: count(1))
-        self.broker_procs = []
-        self.client_procs = []
+        self.worker_counters = defaultdict(lambda: count(1))
+        self.topology = Topology()
+        self.ctx = NetworkContext(self.topology)
         self.env = simpy.Environment()
         self.csv_file = open(f'{name}.csv', 'w')
         self.logger = logging.getLogger('scenario')
@@ -50,28 +52,18 @@ class Scenario(metaclass=abc.ABCMeta):
             console_handler = logging.StreamHandler()
             logging.getLogger().addHandler(console_handler)
 
-    def spawn_existing_broker(self, broker: Broker) -> BrokerProcess:
-        bp = BrokerProcess(self.env, self.protocol, broker, self.broker_procs, self.use_vivaldi)
-        self.env.process(bp.run())
-        self.broker_procs.append(bp)
-        return bp
-
-    def create_cloud_broker(self, region: str) -> BrokerProcess:
-        broker = Broker(f'{region}_broker_{next(self.broker_counters[region])}', backhaul=region)
-        broker.materialize(self.topology)
-        bp = BrokerProcess(self.env, self.protocol, broker, self.broker_procs, self.use_vivaldi)
-        self.broker_procs.append(bp)
-        return bp
-
-    def spawn_broker(self, backhaul, name: str) -> BrokerProcess:
-        broker = Broker(name, backhaul=backhaul)
-        broker.materialize(self.topology)
-        return self.spawn_existing_broker(broker)
+    def create_cloud_worker(self, region: str) -> WorkerProcess:
+        host = Host(Node(f'{region}_broker_{next(self.worker_counters[region])}'), backhaul=region)
+        host.materialize(self.topology)
+        wp = WorkerProcess(self.env, self.protocol, host, self.ctx, self.use_vivaldi)
+        self.ctx.add_worker(wp)
+        self.env.process(wp.run())
+        return wp
 
     def spawn_client(self, backhaul, name: str, topic: str, publishers=0, subscribe=False) -> ClientProcess:
         client = Client(name, backhaul=backhaul)
         client.materialize(self.topology)
-        cp = ClientProcess(self.env, self.protocol, client, self.broker_procs[0].node, self.use_vivaldi)
+        cp = ClientProcess(self.env, self.protocol, client, self.ctx.get_brokers()[0].node, self.use_vivaldi)
         if subscribe:
             self.env.process(cp.subscribe(topic))
         self.env.process(cp.run())
@@ -79,12 +71,11 @@ class Scenario(metaclass=abc.ABCMeta):
             self.env.process(cp.run_publisher(topic, self.publish_interval))
         if self.use_vivaldi:
             self.env.process(cp.run_ping_loop())
-        self.client_procs.append(cp)
+        self.ctx.add_client(cp)
         return cp
 
     def spawn_coordinator(self):
-        coordinator_process = CoordinatorProcess(self.env, self.topology, self.protocol, self.client_procs,
-                                                 self.broker_procs, self.use_vivaldi)
+        coordinator_process = CoordinatorProcess(self.env, self.topology, self.protocol, self.ctx, self.use_vivaldi)
         self.topology.add_connection(Connection(coordinator_process.node, 'eu-central'))
         self.env.process(coordinator_process.run_reconnect_process())
         if not self.use_vivaldi:
@@ -94,7 +85,7 @@ class Scenario(metaclass=abc.ABCMeta):
         return self.env.timeout(self.action_interval * 60_000)
 
     def create_initial_topology(self) -> Topology:
-        topology = Topology()
+        topology = self.topology
         topology.load_inet_graph('cloudping')
         # maps region names of cloudping dataset to custom region names
         region_map = {
@@ -125,8 +116,8 @@ class Scenario(metaclass=abc.ABCMeta):
             self.env.run((i+1) * 60_000)
             if self.logger.level > logging.DEBUG:
                 continue
-            if any(len(p.subscribers) > 0 for p in self.broker_procs):
-                for p in self.broker_procs:
+            if any(len(p.subscribers) > 0 for p in self.ctx.get_brokers()):
+                for p in self.ctx.get_brokers():
                     if len(p.subscribers) == 0:
                         continue
                     self.log(f'--- subscribers on {p.node} ---')
@@ -135,7 +126,7 @@ class Scenario(metaclass=abc.ABCMeta):
                             self.log(f'[{topic}] {subscribers}')
             if any(len(s.items) > 0 for s in self.protocol.stores.values()):
                 self.log(f'--- message queues ---')
-                for p in [*self.broker_procs, *self.client_procs]:
+                for p in [*self.ctx.get_brokers(), *self.ctx.get_clients()]:
                     p_msgs = self.protocol.stores[p.node].items
                     counts = {t.__name__: len([m for m in p_msgs if isinstance(m, t)])
                               for t in {type(m) for m in p_msgs}}

@@ -5,9 +5,9 @@ from itertools import product
 from typing import Union, Set, Iterable, Generator, Callable, Tuple, NamedTuple
 
 from ether import vivaldi
-from ether.cell import Broker, Client
+from ether.cell import Broker, Client, Host
 from ether.vivaldi import VivaldiCoordinate
-from simulation.network_context import NetworkContext
+from simulation.network_context import *
 from simulation.protocol import *
 
 
@@ -60,9 +60,8 @@ class NodeProcess(ABC):
         return self.protocol.receive(self.node, *message_types)
 
     def ping_all(self, get_nodes: Callable[[], Iterable[Node]], interval=15_000) -> Generator[simpy.Event, None, None]:
-        while self.running:
-            yield from self.ping_nodes(get_nodes())
-            yield self.env.timeout(interval)
+        yield from self.ping_nodes(get_nodes())
+        yield self.env.timeout(interval)
 
     def ping_nodes(self, nodes: Iterable[Node], pings_per_node=5, interval=0):
         avgs = {n: 0 for n in nodes}
@@ -172,17 +171,50 @@ class ClientProcess(NodeProcess):
         return f'ClientProcess(node={self.node}, broker={self.selected_broker})'
 
 
-class BrokerProcess(NodeProcess):
-    broker: Broker
-    brokers: List['BrokerProcess']
-    subscribers: Dict[str, Set[Node]]
+class WorkerProcess(NodeProcess):
+    host: Host
+    ctx: 'NetworkContext'
 
-    def __init__(self, env: simpy.Environment, protocol: Protocol, broker: Broker, brokers: List['BrokerProcess'],
+    def __init__(self, env: simpy.Environment, protocol: Protocol, host: Host, ctx: 'NetworkContext',
                  execute_vivaldi=False):
         super().__init__(env, protocol, execute_vivaldi)
-        self.broker = broker
-        self.brokers = brokers
+        self.host = host
+        self.ctx = ctx
+        self.bp = BrokerProcess(env, protocol, self, execute_vivaldi)
+        # Shutdown is handled by BrokerProcess
+        del self.handlers[Shutdown]
+
+    def run(self):
+        if self.execute_vivaldi:
+            self.node.coordinate = VivaldiCoordinate()
+            self.env.process(self.ping_all(lambda: [wp.node for wp in self.ctx.get_all_workers()]))
+        return super().run()
+
+    @property
+    def node(self) -> Node:
+        return self.host.node
+
+    def start_broker(self):
+        if not self.bp.running:
+            self.bp.start()
+
+    def shutdown_broker(self):
+        if self.bp.running:
+            self.bp.shutdown()
+
+
+class BrokerProcess(NodeProcess):
+    wp: WorkerProcess
+    ctx: 'NetworkContext'
+    subscribers: Dict[str, Set[Node]]
+
+    def __init__(self, env: simpy.Environment, protocol: Protocol, wp: WorkerProcess, execute_vivaldi=False):
+        super().__init__(env, protocol, execute_vivaldi)
+        self.wp = wp
+        self.ctx = wp.ctx
         self.subscribers = defaultdict(lambda: set())
+        # Ping is handled by WorkerProcess
+        del self.handlers[Ping]
         self.handlers.update({
             FindRandomBrokersRequest: self.handle_random_brokers,
             FindClosestBrokersRequest: self.handle_closest_brokers,
@@ -190,18 +222,13 @@ class BrokerProcess(NodeProcess):
             Unsub: self.handle_unsubscribe,
         })
 
-    def run(self):
-        self.env.process(self.run_pub_process())
-        if self.execute_vivaldi:
-            self.env.process(self.ping_all(lambda: [bp.node for bp in self.broker_procs if bp.running]))
-        return super().run()
-
     def handle_random_brokers(self, message: FindRandomBrokersRequest):
-        yield self.send(message.source, FindRandomBrokersResponse([b.node for b in random.choices(self.brokers, k=5)]))
+        response = FindRandomBrokersResponse([b.node for b in random.choices(self.ctx.get_brokers(), k=5)])
+        yield self.send(message.source, response)
 
     def handle_closest_brokers(self, message: FindClosestBrokersRequest):
-        closest_brokers = sorted(self.brokers, key=lambda b: message.source.distance_to(b.node))
-        yield self.send(message.source, FindClosestBrokersResponse([b.node for b in closest_brokers[:5]]))
+        response = FindClosestBrokersResponse([b.node for b in self.ctx.get_closest_brokers(message.source)[:5]])
+        yield self.send(message.source, response)
 
     def handle_subscribe(self, message: Sub):
         self.subscribers[message.topic].add(message.source)
@@ -227,7 +254,7 @@ class BrokerProcess(NodeProcess):
         message.hops.append(self.node)
 
         destinations = [dest for dest in self.subscribers[message.topic] if dest != message.source]
-        destinations += [broker.node for broker in self.brokers if broker.node not in message.hops
+        destinations += [broker.node for broker in self.ctx.get_brokers() if broker.node not in message.hops
                          and len(broker.subscribers[message.topic]) > 0]
 
         for dest in destinations:
@@ -241,9 +268,13 @@ class BrokerProcess(NodeProcess):
     def total_subscribers(self):
         return len(set().union(*self.subscribers.values()))
 
+    def start(self):
+        self.env.process(self.run())
+        self.env.process(self.run_pub_process())
+
     @property
     def node(self) -> Node:
-        return self.broker.node
+        return self.wp.node
 
     # def shutdown(self):
     #     events = []
@@ -257,9 +288,6 @@ class BrokerProcess(NodeProcess):
     #     events.append(super().shutdown())
     #     return simpy.AllOf(self.env, events)
 
-    def _running_brokers(self) -> List['BrokerProcess']:
-        return list(filter(lambda bp: bp.running, self.brokers))
-
     def __repr__(self):
         return f'BrokerProcess(node={self.node})'
 
@@ -268,24 +296,22 @@ class CoordinatorProcess:
     env: simpy.Environment
     topology: Topology
     protocol: Protocol
-    client_procs: List[ClientProcess]
-    broker_procs: List[BrokerProcess]
+    ctx: 'NetworkContext'
     use_coordinates: bool
     node: Node
 
-    def __init__(self, env: simpy.Environment, topology: Topology, protocol: Protocol,
-                 client_procs: List[ClientProcess], broker_procs: List[BrokerProcess], use_coordinates=False):
+    def __init__(self, env: simpy.Environment, topology: Topology, protocol: Protocol, ctx: 'NetworkContext',
+                 use_coordinates=False):
         self.env = env
         self.topology = topology
         self.protocol = protocol
-        self.client_procs = client_procs
-        self.broker_procs = broker_procs
+        self.ctx = ctx
         self.use_coordinates = use_coordinates
         self.node = Node('coordinator')
 
     def run_reconnect_process(self):
         while True:
-            for client in self.client_procs:
+            for client in self.ctx.get_clients():
                 current_broker = self.get_broker(client.selected_broker)
                 optimal_brokers = self.brokers_in_lowest_latency_group(client.node, False)
                 if len(optimal_brokers) == 0:
@@ -310,206 +336,27 @@ class CoordinatorProcess:
 
     def run_monitoring_process(self):
         while True:
-            for cp in self.client_procs:
+            for cp in self.ctx.get_clients():
                 self.env.process(self.do_monitoring(cp))
             yield self.env.timeout(15_000)
 
     def do_monitoring(self, cp: ClientProcess):
-        for bp in [bp for bp in self.broker_procs if bp.running]:
+        for bp in [bp for bp in self.ctx.get_brokers() if bp.running]:
             yield self.protocol.send(self.node, cp.node, QoSRequest(bp.node))
             yield self.protocol.receive(self.node, QoSResponse)
 
-    def get_broker(self, node: Node) -> BrokerProcess:
-        return next(b for b in self.broker_procs if b.node == node)
+    def get_broker(self, node: Node) -> Optional[BrokerProcess]:
+        for b in self.ctx.get_brokers():
+            if b.node == node:
+                return b
+        return None
 
     def brokers_in_lowest_latency_group(self, node: Node, use_coordinates: bool) -> List[BrokerProcess]:
         running_brokers = sorted([(self.topology.latency(node, bp.node, use_coordinates), bp)
-                                  for bp in self.broker_procs if bp.running], key=lambda t: t[0])
+                                  for bp in self.ctx.get_brokers()], key=lambda t: t[0])
         group_boundaries = [0, 2, 5, 10, 20, 50, 100, 200, 500, 1000, float('Inf')]
         for (low, high) in zip(group_boundaries, group_boundaries[1:]):
             group_brokers = [b[1] for b in running_brokers if low <= b[0] < high]
             if len(group_brokers) > 0:
                 return group_brokers
         return []
-
-
-class StartAllBrokerOrchestrationProcess:
-    env: simpy.Environment
-    broker_procs: List[BrokerProcess]
-
-    def __init__(self, env: simpy.Environment, broker_procs: List[BrokerProcess]):
-        self.env = env
-        self.broker_procs = broker_procs
-
-    def run(self):
-        while True:
-            for bp in self.broker_procs:
-                if not bp.running:
-                    self.env.run(bp.run)
-            yield self.env.timeout(15_000)
-
-
-class DistanceBasedBrokerScalerProcess:
-    env: simpy.Environment
-    context: NetworkContext
-
-    def __init__(self, env: simpy.Environment, context: NetworkContext, th_up: float, th_down: float):
-        self.env = env
-        self.context = context
-        self.th_up = th_up
-        self.th_down = th_down
-
-    def run(self):
-        while True:
-            worker_pressures = self.get_worker_pressures(False)
-            p_min = self.calculate_min_pressure()
-            p_max = self.calculate_max_pressure()
-
-            # scale up
-            if len(worker_pressures) > 0:
-                candidate_worker, pressure = max(worker_pressures, lambda t: t[1])
-                pressure = (pressure - p_min) / (p_max - p_min)
-                if pressure > self.th_up:
-                    self.env.process(candidate_worker.run())
-
-            # scale down (only if more than one broker is left)
-            if len(self.context.get_brokers()) > 1:
-                candidate_worker, pressure = min(self.get_worker_pressures(True), lambda t: t[1])
-                pressure = (pressure - p_min) / (p_max - p_min)
-                if pressure < self.th_down:
-                    candidate_worker.shutdown()
-
-            yield self.env.timeout(60_000)
-
-    def get_worker_pressures(self, has_broker: bool) -> List[Tuple[BrokerProcess, float]]:
-        pressures = []
-        for worker in self.context.get_workers(has_broker):
-            pressure = 0
-            for _, distance in self.get_client_distances(worker):
-                pressure += 1 / distance
-            pressures.append((worker, pressure))
-        return pressures
-
-    def calculate_max_pressure(self):
-        return self.context.get_num_clients()
-
-    def calculate_min_pressure(self):
-        min_pressure = int('Inf')
-        for worker in self.context.get_all_workers():
-            pressure = 1 / max(self.get_client_distances(worker), lambda t: t[1])
-            if pressure < min_pressure:
-                min_pressure = pressure
-        return min_pressure
-
-    def get_client_distances(self, worker: BrokerProcess) -> List[Tuple[ClientProcess, float]]:
-        return [(client, worker.node.distance_to(client.node)) for client in self.context.client_procs]
-
-
-class DistanceDiffBrokerScalerProcess:
-    env: simpy.Environment
-    ctx: NetworkContext
-
-    def __init__(self, env: simpy.Environment, context: NetworkContext, th_up: float, th_down: float):
-        self.env = env
-        self.ctx = context
-        self.th_up = th_up
-        self.th_down = th_down
-
-    def run(self):
-        # TODO
-        pass
-
-    def get_worker_pressures(self) -> List[Tuple[BrokerProcess, float]]:
-        """
-        Pressure for scale-up (if pressure is high, add broker)
-
-        :return: a list of scalar pressure values for each worker
-        """
-        return [(worker, self.calc_worker_pressure(worker)) for worker in self.ctx.get_idle_workers()]
-
-    def get_broker_pressures(self) -> List[Tuple[BrokerProcess, float]]:
-        """
-        Pressure for scale-down (if pressure is low, remove broker)
-
-        :return: a list of scalar pressure values for each broker
-        """
-        return [(broker, self.calc_broker_pressure(broker)) for broker in self.ctx.get_brokers()]
-
-    def calc_worker_pressure(self, worker: BrokerProcess) -> float:
-        """
-        Calculates a pressure that uses as proxy the potential improvement in distance (latency) for clients, if a
-        broker were scaled to the given worker. It works under the assumption that clients will be connected to the
-        closest broker.
-
-        :param worker: the candidate worker
-        :return: a scalar value estimating the goodness of spawning a broker on this worker
-        """
-        # alternatively: calculate the average, or the % improvement, ...
-
-        pressure = 0
-        for _, distance_to_worker, distance_to_connected_broker in self._get_worker_pressure_tuples(worker):
-            # if the broker is 100 away, and the candidate worker 10, the improvement for the client would be 90
-            pressure += (distance_to_connected_broker - distance_to_worker)
-
-        pressure = math.log(pressure)
-
-        return pressure
-
-    def calc_broker_pressure(self, broker: BrokerProcess) -> float:
-        """
-        Naively: estimate how bad it would be to remove this broker. Builds on the assumption that, if this broker were
-        to be removed, the clients would be connected to the next-closest broker. If the pressure is low (proxy for
-        latency penalty), then we can remove the broker.
-
-        :param broker: the candidate broker to be removed
-        :return: a scalar value estimating the goodness of removing this broker
-        """
-        # alternatively: calculate the average, or the % improvement, ...
-        pressure = 0
-        for _, distance_to_broker, distance_to_next in self._get_broker_pressure_tuples(broker):
-            # if the current broker is 10 away, and the next is 100 away, the penalty would be 90.
-            pressure += (distance_to_next - distance_to_broker)
-
-        pressure = math.log(pressure)
-
-        return pressure
-
-    def _get_broker_pressure_tuples(self, broker: BrokerProcess) -> List[Tuple[ClientProcess, float, float]]:
-        def get_next_broker_distance(c: ClientProcess) -> Tuple[BrokerProcess, float]:
-            brokers = [(b, b.node.distance_to(c.node)) for b in self.ctx.get_brokers() if b.node != broker.node]
-            return min(brokers, key=lambda bd: bd[1])
-
-        client_proximity = self.ctx.get_client_distances(broker)
-        potentials = list()
-
-        for client, distance_to_here in client_proximity:
-            if client.selected_broker != broker.node:
-                continue
-
-            _, distance_to_next = get_next_broker_distance(client)
-
-            if distance_to_here >= distance_to_next:
-                # client is connected to a broker that's closer than the candidate
-                continue
-
-            potentials.append((client, distance_to_here, distance_to_next))
-
-        return potentials
-
-    def _get_worker_pressure_tuples(self, worker: BrokerProcess) -> List[Tuple[ClientProcess, float, float]]:
-        """
-        :param worker: the candidate worker
-        :return: a list of tuples with: the client, the distance to the worker, the distance to the connected broker
-        """
-        client_proximity = self.ctx.get_client_distances(worker)
-        potentials = list()
-
-        for client, distance_to_here in client_proximity:
-            distance_to_broker = client.node.distance_to(client.selected_broker)
-            if distance_to_here >= distance_to_broker:
-                # client is connected to a broker that's closer than the candidate worker
-                continue
-
-            potentials.append((client, distance_to_here, distance_to_broker))
-
-        return potentials

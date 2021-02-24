@@ -38,7 +38,9 @@ class EmmaScenario(Scenario):
         self.publishers_per_client = publishers_per_client
 
     def spawn_cloud_broker(self, region: str):
-        return self.spawn_broker(region, f'{region}_broker_{next(self.broker_counters[region])}')
+        wp = self.create_cloud_worker(region)
+        wp.start_broker()
+        return wp.bp
 
     def spawn_cloud_client(self, region: str, topic: Optional[str], publishers=1, subscribe=True):
         name = f'{region}_client_{next(self.client_counters[region])}'
