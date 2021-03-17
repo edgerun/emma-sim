@@ -1,6 +1,9 @@
 # IntelliJ IDEA project files
 .idea
 
+*.csv
+*.log
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

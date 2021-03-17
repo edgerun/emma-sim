@@ -1,0 +1,1 @@
+edgerun-ether>=0.3.2
